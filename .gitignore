@@ -23,10 +23,22 @@ wheels/
 #other
 **/.claude/
 **/workspace/
-**/CLAUDE.md
 **/logs/
 *.env
 *.env.local
 *.env.development
 *.env.production
 *.env.test
+
+# Large files - checkpoints, models, data
+experiment/checkpoints/
+experiment/data/
+experiment/*_output/
+experiment/*.log
+experiment/*.pid
+DataScience-Instruct-500K/
+*.safetensors
+*.parquet
+*.bin
+*.pt
+*.pth
