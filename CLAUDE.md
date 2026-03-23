@@ -8,6 +8,90 @@ Reproducing the DeepAnalyze paper's 4-stage training pipeline:
 - **Training data**: DataScience-Instruct-500K (reasoning / interaction / RL subsets)
 - **Evaluation**: DABStep-Research benchmark with LLM judge + checklist scoring
 
+## Environment Setup (DO THIS FIRST)
+
+### 1. Download base model
+
+```bash
+# DeepSeek-R1-0528-Qwen3-8B (~16GB)
+pip install huggingface_hub
+huggingface-cli download deepseek-ai/DeepSeek-R1-0528-Qwen3-8B --local-dir ./models/DeepSeek-R1-0528-Qwen3-8B
+```
+
+HuggingFace page: https://huggingface.co/deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
+
+This is a Qwen3-8B architecture model fine-tuned by DeepSeek for reasoning. The paper uses this as the base for all stages.
+
+### 2. Download training data
+
+```bash
+# DataScience-Instruct-500K dataset
+# HuggingFace: https://huggingface.co/datasets/RUC-DataLab/DataScience-Instruct-500K
+huggingface-cli download RUC-DataLab/DataScience-Instruct-500K --repo-type dataset --local-dir ./DataScience-Instruct-500K
+```
+
+Dataset structure after download:
+```
+DataScience-Instruct-500K/
+├── reasoning/                  # Stage1 SFT data
+│   ├── file_csv_3007.json      (3,007 samples)
+│   ├── file_database_3833.json (3,833 samples)
+│   ├── file_xlsx_3663.json     (3,663 samples)
+│   └── file_any_2520.json      (2,520 samples)
+├── interation/                 # Stage2 cold-start SFT data
+│   ├── data_analysis_3936.json
+│   ├── data_cleaning_1616.json
+│   ├── data_insight_1062.json
+│   └── research_report_generation_4327.json
+└── RL/                         # Stage3 GRPO RL data
+    ├── datatask.parquet
+    ├── qa.parquet
+    └── reseach_small.parquet
+```
+
+### 3. Install dependencies
+
+```bash
+pip install ms-swift vllm transformers peft bitsandbytes openai tqdm
+pip install flash-attn --no-build-isolation  # A800 + CUDA 12.8 should work
+```
+
+ms-swift is also available from the repo's bundled source at `deepanalyze/ms-swift/`:
+```bash
+pip install -e deepanalyze/ms-swift
+```
+
+### 4. Add special tokens to base model
+
+The DeepAnalyze format requires 10 special tokens. Run BEFORE training:
+```bash
+python experiment/add_vocab_light.py \
+  --model_path ./models/DeepSeek-R1-0528-Qwen3-8B \
+  --save_path ./models/DeepSeek-R1-0528-Qwen3-8B-addvocab
+```
+
+Tokens added: `<Analyze>`, `</Analyze>`, `<Code>`, `</Code>`, `<Execute>`, `</Execute>`, `<Understand>`, `</Understand>`, `<Answer>`, `</Answer>` (IDs 151671–151680)
+
+This script modifies tokenizer JSON files only (no model weight loading), and hardlinks safetensors to save disk space.
+
+### 5. Create experiment/.env
+
+```bash
+cat > experiment/.env << 'EOF'
+OPENAI_API_KEY=sk-your-key-here
+OPENAI_BASE_URL=https://api.openai.com/v1
+LLM_JUDGE_MODEL=gpt-4o-mini
+
+BASE_MODEL_PATH=./models/DeepSeek-R1-0528-Qwen3-8B
+BASE_MODEL_ADDVOCAB_PATH=./models/DeepSeek-R1-0528-Qwen3-8B-addvocab
+DATA_DIR=./DataScience-Instruct-500K
+EXPERIMENT_DIR=./experiment
+WORKSPACE_DIR=./example/analysis_on_student_loan/data
+EOF
+```
+
+Adjust paths to absolute paths matching your cluster layout.
+
 ## 4-Stage Pipeline
 
 | Stage | Type | Data | Description |
@@ -21,7 +105,10 @@ Reproducing the DeepAnalyze paper's 4-stage training pipeline:
 
 ### What to do
 
-Run full SFT (NOT LoRA) on ALL reasoning data using a single A800 80GB GPU.
+1. Complete environment setup above (download model, data, install deps, add vocab)
+2. Run full SFT (NOT LoRA) on ALL reasoning data using a single A800 80GB GPU
+3. Save the final checkpoint (needed as base for Stage2 and Stage3)
+4. Run inference on student loan test task to verify quality
 
 ### Key decisions already made
 
@@ -47,6 +134,7 @@ total_steps:    ~808 (12938 samples / 16 effective batch)
 attn_impl:      flash_attn
 packing:        false
 gradient_checkpointing: true
+model_type:     qwen3
 ```
 
 ### Reference script
@@ -59,12 +147,12 @@ See `experiment/train_stage1_sft_a800.py` — written for A800 cluster. Key thin
 ### How to run
 
 ```bash
-# Option A: Run the existing script (edit paths first)
+# Option A: Run the existing script (edit paths at top first)
 CUDA_VISIBLE_DEVICES=7 nohup python experiment/train_stage1_sft_a800.py > experiment/sft_a800.log 2>&1 &
 
-# Option B: Rewrite from scratch using ms-swift CLI directly
+# Option B: Use ms-swift CLI directly
 swift sft \
-  --model <base_model_path> \
+  --model <addvocab_model_path> \
   --train_type full \
   --dataset <train.jsonl> \
   --max_length 8192 \
@@ -87,22 +175,7 @@ Training data is ms-swift format JSONL:
 {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
 ```
 
-Source files in `DataScience-Instruct-500K/reasoning/`:
-- `file_csv_3007.json` (3,007 samples)
-- `file_database_3833.json` (3,833 samples)
-- `file_xlsx_3663.json` (3,663 samples)
-- `file_any_2520.json` (2,520 samples)
-
-Each sample has `messages`, `input_tokens`, `output_tokens`, `total_tokens`, `evaluation` fields. Only `messages` is needed for training.
-
-## Special Tokens (added via add_vocab)
-
-The base model needs 10 special tokens added to tokenizer:
-`<Analyze>`, `</Analyze>`, `<Code>`, `</Code>`, `<Execute>`, `</Execute>`, `<Understand>`, `</Understand>`, `<Answer>`, `</Answer>` (IDs 151671–151680)
-
-Script: `experiment/add_vocab_light.py` — modifies tokenizer JSON only (no model weight loading), hardlinks safetensors files.
-
-If the base model on the cluster already has these tokens in its tokenizer, skip this step. If not, run `add_vocab_light.py` first to create a `*-addvocab` version.
+Source JSON files have additional metadata fields (`input_tokens`, `output_tokens`, `total_tokens`, `evaluation`). Only `messages` is needed for training. The `prepare_data.py` or `train_stage1_sft_a800.py` scripts handle conversion automatically.
 
 ## Inference (after training)
 
@@ -123,14 +196,6 @@ Located in `playground/DABStep-Research/`:
 - `gpt_eval.py` — LLM judge scoring (Content 1-5 + Format 1-5, averaged)
 - Checklist is NOT scored per-item; it's passed as context to the LLM judge as "reference points for an ideal report"
 
-## Dependencies
-
-- ms-swift (`pip install ms-swift`)
-- flash-attn (should work on A800 + CUDA 12.8)
-- vllm
-- transformers, peft, bitsandbytes
-- openai (for LLM judge in RL stage)
-
 ## Lessons Learned from RTX 5090 Run
 
 1. **max_length=1792 was disastrous** — truncated 63.6% of data, resulting in only 11 effective training steps. Use 8192.
@@ -138,6 +203,7 @@ Located in `playground/DABStep-Research/`:
 3. **vLLM inference needs `stop=["</Answer>", "<|im_end|>"]`** — without `<|im_end|>` the model may not stop properly
 4. **LoRA merge**: use PEFT API `model.merge_and_unload()` directly, NOT `swift export` (which fails if output dir exists)
 5. **Full SFT uses lower LR** (1e-5) than LoRA (5e-5) to avoid catastrophic forgetting
+6. **add_vocab_light.py** is preferred over `deepanalyze/add_vocab.py` — the original loads full model weights (~16GB RAM), the light version only modifies tokenizer files
 
 ## After Stage1
 
